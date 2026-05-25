@@ -1,0 +1,1014 @@
+---
+title: "COVID-19 testing в CHOP: факторы положительного теста"
+author: "Бондаренко Илья"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    code_folding: show
+    df_print: kable
+    theme: flatly
+  pdf_document:
+    toc: true
+    toc_depth: '2'
+subtitle: Хакатон по биостатистике
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, warning = FALSE, message = FALSE,
+  fig.width = 8, fig.height = 8, dpi = 130
+)
+
+pkgs <- c("dplyr", "ggplot2", "tidyr", "readr", "forcats", "broom", "pROC", "stringr", "purrr", "rstatix", "scales", "kableExtra", "splines")
+
+to_install <- setdiff(pkgs, rownames(installed.packages()))
+if (length(to_install)) {
+  install.packages(to_install, repos = "https://cloud.r-project.org")
+}
+
+invisible(lapply(pkgs, library, character.only = TRUE))
+
+set.seed(2026)
+```
+
+
+# Клинический контекст и главный вопрос
+
+Источник-`medicaldata::covid_testing` (Children's Hospital of
+Pennsylvania, 2020).
+
+В выборке `n = 15 524` ПЦР-тестов, период
+соответствует первой волне эпидемии. Госпиталь детский, но тестировались
+и взрослые.
+
+**Главный вопрос:**
+Какие факторы связаны с **положительным** результатом теста?
+
+Исследуем бинарный исход → **логистическая регрессия** на полной выборке
+positive/negative.
+
+# Импорт данных
+
+```{r import}
+raw <- read_csv("12_covid_testing_chop.csv", show_col_types = FALSE)
+dim(raw)
+```
+
+Структура таблицы и типы переменных:
+
+```{r structure}
+glimpse(raw)
+```
+```{r}
+summary(raw)
+```
+
+
+# Подготовка данных
+
+Видим, что есть неадекватные значения в колонке `age`, т.к. есть человек, которому 138 лет. В реальности же, самому большому долгожителю Земли, из всех живущих, было 122 года. (Также есть отрицательные значения времени в колонке `rec_ver_tat`, которая означает время от получения теста до верификации, но ее мы не используем в нашей модели). Возраст в 0 лет мы считаем адекватным, т.к. эта детская больница и тест могли делать новорожденным.
+
+```{r}
+# Посмотрим, сколько в нашем датасете тех, кому больше 100 лет.
+raw |>
+  filter(age > 100) |>
+  select(subject_id, age, demo_group, patient_class) |>
+  arrange(desc(age))
+```
+```{r}
+# Наблюдения с возрастом >100 лет были расценены как вероятные ошибки ввода и исключены из анализа.
+n_before <- nrow(raw)
+
+raw <- raw |>
+  filter(age <= 100)
+
+cat("Было:      ", n_before, "\n")
+cat("Осталось:  ", nrow(raw), "\n")
+cat("Исключено: ", n_before - nrow(raw), "\n")
+
+```
+
+
+Пропуски по колонкам:
+
+```{r missing}
+miss_tbl <- raw |>
+  summarise(across(everything(), ~ sum(is.na(.x)))) |>
+  pivot_longer(everything(), names_to = "var", values_to = "n_missing") |>
+  mutate(pct = round(100 * n_missing / nrow(raw), 1)) |>
+  arrange(desc(pct))
+miss_tbl
+```
+* `result` имеет 3 уровня (negative / positive / invalid). Оставляем только positive vs negative - это корректные исходы.
+* `patient_class` и `payor_group` пропущены у ~46%. Пропуски
+  кодируем отдельным уровнем `missing`, чтобы не терять половину
+  выборки.
+* `ct_result` пропущен у 209 - не используем как
+  предиктор (он практически зеркало `result`, т.к. оно показывает кол-ва вируса в человеке).
+
+
+
+Проверяем сколько тестов, которые делал один человек
+
+```{r}
+raw |>
+  count(subject_id) |>
+  count(n, name = "n_patients") |>
+  rename(n_tests = n) |>
+  mutate(pct = round(100 * n_patients / sum(n_patients), 1))
+```
+Получилось, что более 14 процентов датасета это не независимые записи - это тесты, которые делали одни и те же люди.
+Будем считать, что тест, сделанный как минимум через месяц после предыдущего, является независимым.
+
+```{r}
+df_independent <- raw |>
+  arrange(subject_id, pan_day) |>
+  group_by(subject_id) |>
+  filter(pan_day - lag(pan_day, default = -31) >= 30) |>  # разница >= 30 дней
+  ungroup()
+
+cat("Исходно тестов:   ", nrow(raw), "\n")
+cat("После фильтрации: ", nrow(df_independent), "\n")
+cat("Выброшено:        ", nrow(raw) - nrow(df_independent), "\n")
+```
+
+Если вывести категории `patient_class` и `payor_group`, можно увидеть, что подгруппы, в которых менее 100 человек, носят в основном административный характер (либо слишком маленькие для стат. выводов), и их можно объединить в одну группу, чтобы не терять данные.
+В случае 1 кейса `unidentified` в `demo_group` от него мы просто избавляемся.
+```{r}
+raw |> count(demo_group) |> arrange(n)
+raw |> count(patient_class) |> arrange(n)
+raw |> count(payor_group) |> arrange(n)
+
+```
+
+```{r}
+df_logit <- df_independent |>
+  # исключаем invalid: не клинический исход
+  filter(result %in% c("positive", "negative")) |>
+  filter(demo_group != "unidentified") |>
+  mutate(
+    positive   = as.integer(result == "positive"),
+    gender     = factor(gender, levels = c("female", "male")),
+    drive_thru = factor(drive_thru_ind, levels = c(0, 1),
+                        labels = c("clinic", "drive_thru")),
+    orderset   = factor(orderset, levels = c(0, 1),
+                        labels = c("no_orderset", "orderset")),
+
+    # Из-за высокой доли пропусков удаление наблюдений могло привести к существенной потере мощности исследования, поэтому пропуски были выделены в отдельную категорию, поэтому пропуски идут в отдельную категорию missing.
+    
+    patient_class = factor(if_else(is.na(patient_class), "patient_class_missing", patient_class)),
+    payor_group   = factor(if_else(is.na(payor_group),   "payor_group_missing", payor_group)),
+
+    # редкие уровни (<100 наблюдений) схлопываем в "other";
+    patient_class = fct_lump_min(patient_class, min = 100, other_level = "other_patient_class"),
+    payor_group    = fct_lump_min(factor(payor_group), min = 100, other_level = "other_payor_group")
+  ) |>
+  #  reference levels-клинически интерпретируемые
+  mutate(
+    demo_group    = fct_relevel(demo_group,    "patient"),
+    patient_class = fct_relevel(patient_class, "outpatient"),
+    drive_thru    = fct_relevel(drive_thru,    "clinic"),
+    orderset      = fct_relevel(orderset,      "no_orderset"),
+    payor_group   = fct_relevel(payor_group,   "commercial")
+  )
+# Референс outpatient выбран как клинически интерпретируемая группа, несмотря на то что наиболее частой категорией является missing (45%).
+
+cat("df_logit:", nrow(df_logit), "тестов;",
+    sum(df_logit$positive), "positive",
+    sprintf("(%.2f%%)\n", 100 * mean(df_logit$positive)))
+```
+
+```{r}
+age_group_plot <- raw |>
+  filter(result %in% c("positive", "negative")) |>
+  mutate(
+    positive  = as.integer(result == "positive"),
+    age_group = case_when(
+      age < 5            ~ "<5 лет",
+      age >= 5 & age < 18 ~ "5–17 лет",
+      age >= 18           ~ "18+ лет",
+      TRUE               ~ NA_character_
+    ),
+    age_group = factor(age_group, levels = c("<5 лет", "5–17 лет", "18+ лет"))
+  ) |>
+  group_by(age_group) |>
+  summarise(
+    n_tests      = n(),
+    n_positive   = sum(positive, na.rm = TRUE),
+    pct_positive = n_positive / n_tests,
+    .groups = "drop"
+  )
+
+ggplot(age_group_plot, aes(x = age_group, y = pct_positive, fill = age_group)) +
+  geom_col(width = 0.65) +
+  geom_text(
+    aes(label = paste0(percent(pct_positive, accuracy = 0.1), "\nn = ", n_tests)),
+    vjust = -0.4,
+    size  = 4.5,
+    fontface = "bold"
+  ) +
+  scale_fill_manual(values = c(
+    "<5 лет"   = "#2c7fb8",
+    "5–17 лет" = "#7fcdbb",
+    "18+ лет"  = "#d7301f"
+  )) +
+  scale_y_continuous(
+    labels = percent_format(accuracy = 1),
+    limits = c(0, max(age_group_plot$pct_positive) * 1.3)
+  ) +
+  labs(
+    title    = "Доля положительных ПЦР-тестов по возрастным группам",
+    subtitle = "CHOP COVID-19 testing dataset, 2020 (все тесты до фильтрации)",
+    x        = "Возрастная группа",
+    y        = "% positive"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "none")
+```
+
+
+**Reference levels** заданы явно:
+
+* `demo_group = patient`-основная клиническая группа (пациенты CHOP).
+* `patient_class = outpatient`-типичный амбулаторный визит.
+* `drive_thru = clinic`-забор внутри клиники.
+* `orderset = no_orderset`-без стандартизованного протокола.
+* `payor_group = commercial`-частая страховка.
+* `gender = female`-по умолчанию.
+
+Все коэффициенты регрессии будут читаться **относительно этих уровней**.
+
+# Описательная статистика
+
+Считаем таблицу для каждой переменной: сколько всего, сколько
+positive, какая доля positive. 
+
+## Числовые переменные (возраст)
+
+```{r baseline-num}
+df_logit |>
+  group_by(result) |>
+  summarise(n          = n(),
+            age_mean   = round(mean(age), 1),
+            age_sd     = round(sd(age),   1),
+            age_median = median(age))
+```
+
+## Доля positive по полу
+
+```{r baseline-gender}
+df_logit |>
+  group_by(gender) |>
+  summarise(n            = n(),
+            n_pos        = sum(positive),
+            pct_positive = round(100 * mean(positive), 2))
+```
+
+## Доля positive по demo_group
+
+```{r baseline-demo}
+df_logit |>
+  group_by(demo_group) |>
+  summarise(n            = n(),
+            n_pos        = sum(positive),
+            pct_positive = round(100 * mean(positive), 2))
+```
+
+## Доля positive по patient_class
+
+```{r baseline-class}
+df_logit |>
+  group_by(patient_class) |>
+  summarise(n            = n(),
+            n_pos        = sum(positive),
+            pct_positive = round(100 * mean(positive), 2))
+```
+
+## Доля positive по drive_thru
+
+```{r baseline-drive}
+df_logit |>
+  group_by(drive_thru) |>
+  summarise(n            = n(),
+            n_pos        = sum(positive),
+            pct_positive = round(100 * mean(positive), 2))
+```
+
+## Доля positive по orderset
+
+```{r baseline-orderset}
+df_logit |>
+  group_by(orderset) |>
+  summarise(n            = n(),
+            n_pos        = sum(positive),
+            pct_positive = round(100 * mean(positive), 2))
+```
+```{r}
+make_num_row <- function(df, var, label) {
+  df |>
+    group_by(result) |>
+    summarise(
+      val = sprintf("%.0f (%.0f–%.0f)",
+                    median(.data[[var]], na.rm = TRUE),
+                    quantile(.data[[var]], 0.25, na.rm = TRUE),
+                    quantile(.data[[var]], 0.75, na.rm = TRUE)),
+      .groups = "drop"
+    ) |>
+    pivot_wider(names_from = result, values_from = val) |>
+    mutate(variable = label) |>
+    select(variable, negative, positive)
+}
+
+make_cat_rows <- function(df, var, label) {
+  df |>
+    group_by(result, level = .data[[var]]) |>
+    summarise(n = n(), .groups = "drop") |>
+    group_by(result) |>
+    mutate(pct  = round(100 * n / sum(n), 1),
+           val  = sprintf("%d (%.1f%%)", n, pct)) |>
+    ungroup() |>
+    select(result, level, val) |>
+    pivot_wider(names_from = result, values_from = val) |>
+    mutate(variable = paste0(label, ": ", level)) |>
+    select(variable, negative, positive)
+}
+
+n_neg <- sum(df_logit$result == "negative")
+n_pos <- sum(df_logit$result == "positive")
+
+table1 <- bind_rows(
+  make_num_row(df_logit, "age",     "Age, median (IQR)"),
+  make_num_row(df_logit, "pan_day", "Pan day, median (IQR)"),
+  make_cat_rows(df_logit, "gender",        "Gender"),
+  make_cat_rows(df_logit, "demo_group",    "Demo group"),
+  make_cat_rows(df_logit, "patient_class", "Patient class"),
+  make_cat_rows(df_logit, "drive_thru",    "Drive-thru"),
+  make_cat_rows(df_logit, "orderset",      "Orderset"),
+  make_cat_rows(df_logit, "payor_group",   "Payor group")
+)
+
+table1 |>
+  knitr::kable(
+    col.names = c("Variable",
+                  sprintf("Negative (n=%d)", n_neg),
+                  sprintf("Positive (n=%d)", n_pos)),
+    align = c("l", "r", "r"),
+    caption = "Table 1. Baseline characteristics by COVID-19 test result"
+  )
+```
+```{r fig.width=12, fig.height=10}
+vars_to_plot <- list(
+  gender        = "Gender",
+  demo_group    = "Demo group",
+  patient_class = "Patient class",
+  drive_thru    = "Drive-thru",
+  orderset      = "Orderset",
+  payor_group   = "Payor group"
+)
+
+plot_data <- map2(names(vars_to_plot), vars_to_plot, function(var, label) {
+  df_logit |>
+    group_by(result, level = .data[[var]]) |>
+    summarise(n = n(), .groups = "drop") |>
+    group_by(result) |>
+    mutate(pct = 100 * n / sum(n)) |>
+    ungroup() |>
+    mutate(variable = label,
+           level = as.character(level))
+}) |>
+  bind_rows()
+
+ggplot(plot_data, aes(x = fct_reorder(level, pct), y = pct, fill = result)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = c("negative" = "#2c7fb8", "positive" = "#d7301f"),
+                    name = NULL) +
+  facet_wrap(~ variable, scales = "free_x", ncol = 2) +
+  labs(x = NULL, y = "%", 
+       caption = "Группы с n < 100 не показаны") +
+  theme_minimal() +
+  theme(
+    strip.text = element_text(face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "top"
+  )
+```
+
+**Описательно (без причинных утверждений):**
+
+Медианный возраст позитивных пациентов заметно выше (15 vs 8 лет), что отражает специфику CHOP как 
+детского госпиталя-взрослые тестировались реже, но чаще оказывались позитивными. Drive-thru тестирование 
+  ассоциировано с более высокой долей позитивных (55% vs 45%), а пациенты с государственной страховкой или 
+  без указанного плательщика (`government`, `missing`) представлены среди позитивных непропорционально больше, 
+  чем среди негативных.
+
+# Графики
+
+## График 1. Возраст по исходу
+
+```{r fig1, fig.width=7, fig.height=4.5, fig.cap="Распределение возраста: positive vs negative"}
+ggplot(df_logit, aes(age, fill = factor(positive))) +
+  geom_histogram(bins = 40, position = "identity", alpha = 0.55) +
+  scale_fill_manual(values = c("0" = "#2c7fb8", "1" = "#d7301f"),
+                    labels = c("negative", "positive"), name = NULL) +
+  labs(x = "Возраст (лет)", y = "Число тестов") +
+  theme_minimal()
+```
+
+### Положительность по возрастным группам
+
+```{r tbl-age-group}
+df_logit |>
+  mutate(age_group = cut(age,
+                         breaks = c(0, 5, 18, Inf),
+                         labels = c("< 5 (раннее детство)",
+                                    "5-17 (школьники/подростки)",
+                                    "18+ (взрослые)"),
+                         right = FALSE,
+                         include.lowest = TRUE)) |>
+  group_by(age_group) |>
+  summarise(n            = n(),
+            n_pos        = sum(positive),
+            pct_positive = round(100 * mean(positive), 2))
+```
+
+Большинство тестов сделано у детей (CHOP - детский госпиталь). Доля
+positive выше у взрослых. Это может
+отражать то, что взрослые тестируемые представляют другую группу по
+составу и показаниям к тестированию
+```{r fig.width=7, fig.height=12}
+# Считаем pct_positive для каждой переменной/уровня
+vars_to_plot <- list(
+  gender        = "Gender",
+  demo_group    = "Demo group",
+  patient_class = "Patient class",
+  drive_thru    = "Drive-thru",
+  orderset      = "Orderset"
+)
+
+plot_data <- map2(names(vars_to_plot), vars_to_plot, function(var, label) {
+  df_logit |>
+    group_by(level = .data[[var]]) |>
+    summarise(
+      n            = n(),
+      pct_positive = 100 * mean(positive),
+      .groups = "drop"
+    ) |>
+    filter(n >= 100) |>  # убираем маленькие группы
+    mutate(variable = label,
+           level    = paste0(level))
+}) |>
+  bind_rows()
+
+ggplot(plot_data, aes(x = pct_positive, y = fct_reorder(level, pct_positive))) +
+  geom_vline(xintercept = 100 * mean(df_logit$positive),
+             linetype = "dashed", colour = "grey50") +
+  geom_point(aes(size = n), colour = "#d7301f") +
+  scale_size_continuous(range = c(2, 8), guide = "none") +
+  facet_wrap(~ variable, scales = "free_y", ncol = 1) +
+  labs(
+    x = "% positive",
+    y = NULL,
+    caption = "Пунктир-общая позитивность. Размер точки-N в группе."
+  ) +
+  theme_minimal() +
+  theme(strip.text = element_text(face = "bold"))
+```
+
+```{r}
+age_positivity <- df_logit |>
+  mutate(
+    age_group = cut(age,
+                    breaks = c(0, 5, 12, 18, 35, Inf),
+                    labels = c("0–4", "5–11", "12–17", "18–34", "35+"),
+                    right  = FALSE,
+                    include.lowest = TRUE)
+  ) |>
+  group_by(age_group) |>
+  summarise(
+    n            = n(),
+    n_pos        = sum(positive),
+    pct_positive = mean(positive),
+    .groups = "drop"
+  )
+
+ggplot(age_positivity, aes(x = age_group, y = pct_positive)) +
+  geom_point(aes(size = n), colour = "#d7301f") +
+  geom_line(aes(group = 1), colour = "#d7301f", alpha = 0.5) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  scale_size_continuous(range = c(3, 8), guide = "none") +
+  labs(
+    x       = "Возрастная группа",
+    y       = "Доля позитивных тестов",
+    title   = "Позитивность по возрастным группам",
+    caption = "Размер точки — N в группе"
+  ) +
+  theme_minimal(base_size = 14)
+```
+График наблюдаемой позитивности по возрастным группам показывает нелинейную связь - позитивность растёт от детей до взрослых 18–34 лет, затем снижается в группе 35+. 
+
+Как и график зависимости позитивности от дня пандемии:
+
+```{r}
+
+pan_day_risk <- df_logit |>
+  mutate(decile = ntile(pan_day, 10)) |>
+  group_by(decile) |>
+  summarise(
+    mean_pan_day     = mean(pan_day),
+    observed_risk    = mean(positive),
+    .groups = "drop"
+  )
+
+ggplot(pan_day_risk, aes(x = mean_pan_day, y = observed_risk)) +
+  geom_point(colour = "#d7301f", size = 3) +
+  geom_line(colour = "#d7301f", alpha = 0.5) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  labs(x = "День пандемии", y = "Доля позитивных",
+       title = "Позитивность по децилям pan_day") +
+  theme_minimal()
+```
+
+# Основной анализ. Логистическая регрессия positivity
+
+## Почему логистическая
+
+Исход бинарный (positive / negative). Линейная регрессия на 0/1
+непригодна: предсказанные значения могут уйти за `[0, 1]`, а ошибки
+негомоскедастичны. 
+
+Экспоненцирование коэффициента даёт **odds ratio** (OR).
+
+## Число событий и не-событий
+
+```{r events}
+events     <- sum(df_logit$positive)
+non_events <- nrow(df_logit) - events
+c(events = events, non_events = non_events)
+```
+## Попарная корреляция
+```{r}
+# Для категориальных-таблица Крамера V
+
+cat_vars <- c("gender", "demo_group", "patient_class", 
+              "drive_thru", "payor_group", "orderset")
+
+# Все попарные комбинации
+combn(cat_vars, 2, simplify = FALSE) |>
+  map_dfr(function(pair) {
+    tbl <- table(df_logit[[pair[1]]], df_logit[[pair[2]]])
+    v   <- cramer_v(tbl)
+    tibble(var1 = pair[1], var2 = pair[2], cramer_v = round(v, 3))
+  }) |>
+  arrange(desc(cramer_v))
+```
+После проверки попарной корреляции (Cramer's V) будут исключены из модели `patient_class` и `payor_group`-46% пропусков и V > 0.6 с оставшимися предикторами. Максимальная корреляция в итоговой модели-V = 0.44 (`demo_group` - `drive_thru`), что находится в допустимых пределах
+
+```{r}
+cor.test(df_logit$age, df_logit$pan_day, method = "spearman")
+```
+Допустимая корреляция, все ок.
+
+```{r}
+# eta squared - аналог Cramer V для числовая vs категориальная
+cat_vars <- c("gender", "demo_group", "drive_thru", "orderset")
+
+map_dfr(cat_vars, function(var) {
+  tibble(
+    var1 = "age",
+    var2 = var,
+    eta  = round(sqrt(summary(aov(age ~ df_logit[[var]], data = df_logit))[[1]][1,2] /
+                      sum(summary(aov(age ~ df_logit[[var]], data = df_logit))[[1]][,2])), 3)
+  )
+})
+```
+Получается, что `demo_group` почти полностью отражает `age`, что логично - `misc adult` и `client` это взрослые, `patient` это в основном дети. Уберем из модели `demo_group`.
+
+
+```{r}
+df_logit <- df_logit |>
+  mutate(
+    age_group4 = cut(age,
+                     breaks = c(0, 12, 18, 35, Inf),
+                     labels = c("0–11", "12–17", "18–34", "35+"),
+                     right  = FALSE,
+                     include.lowest = TRUE),
+    age_group4 = factor(age_group4,
+                        levels = c("0–11", "12–17", "18–34", "35+"))
+  )
+
+m_discrete <- glm(  # модель, где возраст дискретизировали в 4 группы 
+  positive ~ age_group4 + gender + drive_thru + orderset + pan_day,
+  data = df_logit, family = binomial()
+)
+
+m_linear <- glm(      # модель с возрастом в квадрате
+  positive ~ age + gender + drive_thru + orderset + pan_day,
+  data = df_logit, family = binomial()
+)  # классичекая линейная модель
+
+m_poly <- glm(      # модель с возрастом в квадрате
+  positive ~ age + I(age^2) + gender + drive_thru + orderset + pan_day,
+  data = df_logit, family = binomial()
+)
+
+m_spline <- glm(   # модель со spline age
+  positive ~ ns(age, df = 4) + gender + drive_thru + orderset + pan_day,
+  data = df_logit, family = binomial()
+)
+
+# Шаг 1 — сравниваем все четыре модели по AIC
+tibble(
+  model    = c("Линейный age", "Дискретный age (4 группы)",
+               "Полиномиальный age", "Spline age (df=4)"),
+  aic      = c(AIC(m_linear), AIC(m_discrete),
+               AIC(m_poly),   AIC(m_spline)),
+  deviance = c(deviance(m_linear), deviance(m_discrete),
+               deviance(m_poly),   deviance(m_spline))
+) |>
+  mutate(across(c(aic, deviance), ~ round(.x, 1))) |>
+  arrange(aic)
+
+age_grid <- tibble(
+  age        = seq(0, 110, length.out = 200),
+  gender     = factor("female",      levels = levels(df_logit$gender)),
+  drive_thru = factor("clinic",      levels = levels(df_logit$drive_thru)),
+  orderset   = factor("no_orderset", levels = levels(df_logit$orderset)),
+  pan_day    = median(df_logit$pan_day),
+  age_group4 = cut(seq(0, 110, length.out = 200),
+                   breaks = c(0, 12, 18, 35, Inf),
+                   labels = c("0–11", "12–17", "18–34", "35+"),
+                   right  = FALSE,
+                   include.lowest = TRUE)
+) |>
+  mutate(
+    age_group4 = factor(age_group4, levels = levels(df_logit$age_group4)),
+    linear     = predict(m_linear,   newdata = pick(everything()), type = "response"),
+    discrete   = predict(m_discrete, newdata = pick(everything()), type = "response"),
+    polynomial = predict(m_poly,     newdata = pick(everything()), type = "response"),
+    spline     = predict(m_spline,   newdata = pick(everything()), type = "response")
+  ) |>
+  pivot_longer(c(linear, discrete, polynomial, spline),
+               names_to = "model", values_to = "p_hat") |>
+  mutate(model = factor(model,
+                        levels = c("linear", "discrete", "polynomial", "spline"),
+                        labels = c("Линейная", "Дискретная (4 группы)",
+                                   "Полиномиальная", "Spline")))
+
+ggplot(age_grid, aes(x = age, y = p_hat, colour = model)) +
+  geom_line(linewidth = 1.1) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  scale_colour_manual(values = c("#2c7fb8", "#756bb1", "#d7301f", "#31a354")) +
+  labs(
+    x       = "Возраст (лет)",
+    y       = "Предсказанная вероятность позитивного теста",
+    colour  = "Модель",
+    title   = "Форма связи возраста с вероятностью позитивного теста",
+    caption = "Зафиксировано: female, clinic, no_orderset, медианный pan_day"
+  ) +
+  theme_minimal()
+```
+
+Для проверки формы связи возраста с исходом сравнены четыре спецификации: линейная, дискретная (4 группы: 0-11, 12-17, 18–34, 35+), полиномиальная (age^2) и natural spline (df=4). Сравнение по AIC показало что spline описывает данные лучше всего (AIC = 5791).
+
+```{r}
+anova(m_linear, m_spline, test = "Chisq")
+```
+Likelihood ratio test подтвердил что spline-модель значимо лучше линейной (χ^2=55.4, df=3, p < 0.001) - нелинейная спецификация возраста статистически обоснована.
+
+```{r}
+m_spline_interaction <- glm(
+  positive ~ ns(age, df = 4) * orderset + gender + drive_thru + pan_day,
+  data = df_logit, family = binomial()
+)
+
+anova(m_spline, m_spline_interaction, test = "Chisq")
+```
+Проверка взаимодействия age-orderset в spline-модели показала что добавление взаимодействия не улучшает подгонку значимо (χ^2=7.3, df=4, p = 0.12) - взаимодействие в финальную модель не включается.
+
+Аналогично проверяем для pan_day
+
+```{r}
+m_spline_panday <- glm(
+  positive ~ ns(age, df = 4) + gender + drive_thru + orderset + ns(pan_day, df = 3),
+  data = df_logit, family = binomial()
+)
+
+anova(m_spline, m_spline_panday, test = "Chisq")
+
+tibble(
+  model = c("Линейный pan_day", "Spline pan_day (df=3)"),
+  aic   = c(AIC(m_spline), AIC(m_spline_panday))
+)
+```
+Проверка нелинейности pan_day показала что spline-спецификация с df=3 значимо лучше линейной (χ^2=10.4, df=2, p = 0.005, AIC = 5785 vs 5791) — день пандемии также включён в финальную модель через ns(pan_day, df=3).
+
+## Crude OR (одно-предикторные модели)
+
+Сравнение с adjusted OR покажет, какие переменные конфаундируют.
+
+```{r crude}
+predictors <- c("gender", "drive_thru", "orderset")
+
+crude_list <- list()
+for (v in predictors) {
+  fit <- glm(reformulate(v, "positive"), data = df_logit, family = binomial())
+  crude_list[[v]] <- broom::tidy(fit, conf.int = TRUE, exponentiate = TRUE) |>
+    filter(term != "(Intercept)") |>
+    mutate(predictor = v)
+}
+
+crude_or <- bind_rows(crude_list) |>
+
+  select(predictor, term, OR = estimate, conf.low, conf.high, p.value)
+crude_or
+```
+В одно-предикторных моделях значимо ассоциированы с позитивным тестом `orderset` (OR = 1.575, p < 0.001); остальные предикторы незначимы.
+Возраст, pan_day исключён из таблицы crude OR - нелинейная спецификация (spline) не допускает интерпретации через единственный OR. 
+
+## Adjusted OR (главная модель)
+
+Теперь построим модель со всеми предикторами одновременно, чтобы понять какие ассоциации сохраняются после взаимного контроля-и не объясняются ли они друг другом.
+
+```{r adjusted}
+m_logit <- glm(
+  positive ~ ns(age, df = 4) + gender + drive_thru + orderset + ns(pan_day, df = 3),
+  data = df_logit, family = binomial()
+)
+
+adj_or <- broom::tidy(m_logit, conf.int = TRUE, exponentiate = TRUE) |>
+  filter(term != "(Intercept)") |>
+  filter(!str_detect(term, "ns\\(age")) |>  
+  filter(!str_detect(term, "ns\\(pan_day")) |>
+  mutate(sig = if_else(p.value < 0.05, "p<0.05", "ns")) |>
+  select(term, OR = estimate, conf.low, conf.high, p.value, sig)
+
+adj_or
+```
+
+После учёта нелинейности возраста через natural spline значимыми независимыми предикторами положительного теста оказались orderset (OR = 1.46, 95% CI: 1.20-1.79, p < 0.001); эффект возраста и дня пандемии интерпретируется через predicted probabilities ввиду нелинейной спецификации.
+
+Проверяем, что оценка после поправки изменилась не более чем на 20%:
+```{r}
+comparison <- crude_or |>
+  rename(OR_crude = OR, p_crude = p.value) |>
+  inner_join(
+    adj_or |> rename(OR_adj = OR, p_adj = p.value),
+    by = "term"
+  ) |>
+  mutate(
+    pct_change  = round(100 * (OR_adj - OR_crude) / OR_crude, 1),
+    confounding = abs(pct_change) > 20
+  ) |>
+  select(term, OR_crude, OR_adj, pct_change, confounding)
+
+comparison
+```
+
+
+## Forest plot
+
+```{r fig-forest, fig.width=8, fig.height=5, fig.cap="Adjusted OR (95% CI). Линия OR=1-нет эффекта"}
+adj_or |>
+  mutate(
+    term = case_when(
+      term == "gendermale"           ~ "Gender: male",
+      term == "drive_thrudrive_thru" ~ "Drive-thru",
+      term == "ordersetorderset"     ~ "Orderset",
+      TRUE ~ term
+    )
+  ) |>
+  mutate(term = fct_reorder(term, OR)) |>
+  ggplot(aes(OR, term, colour = sig)) +
+  geom_vline(xintercept = 1, linetype = "dashed", colour = "grey50") +
+  geom_point(size = 3) +
+  geom_errorbarh(aes(xmin = conf.low, xmax = conf.high), height = 0.2) +
+  scale_colour_manual(values = c("ns" = "grey60", "p<0.05" = "#d7301f"),
+                      name = NULL) +
+  scale_x_log10(limits = c(0.75, 2.5),
+              breaks  = c(0.8, 0.9, 1.0, 1.25, 1.5, 2.0)) +
+  labs(
+    x = "Odds Ratio (log-шкала)",
+    y = NULL,
+    caption = "Пунктир-OR=1 (нет эффекта). Красный-p<0.05."
+  ) +
+  theme_minimal() +
+  theme(legend.position = "top")
+```
+Forest plot наглядно показывает что из предикторов только orderset значимо ассоциирован с положительным тестом - его доверительный интервалы не пересекает линию OR=1. Orderset смещён вправо (OR=1.46) - протокол направления ассоциирован с более высокой позитивностью.
+
+
+## Predicted probabilities
+
+OR-относительный показатель. Чтобы перевести его на язык врача,
+считаем **вероятность** P(positive) для конкретных пациентов:
+6 возраста × 2 точки забора, остальное фиксируем на референсных уровнях
+(`patient`, `outpatient`, `commercial`, `no_orderset`).
+
+```{r profiles}
+profiles <- expand_grid(
+  age      = c(2, 10, 16, 25, 40, 70),
+  orderset = factor(c("no_orderset", "orderset"),
+                    levels = levels(df_logit$orderset))
+) |>
+  mutate(
+    gender    = factor("female",  levels = levels(df_logit$gender)),
+    drive_thru = factor("clinic", levels = levels(df_logit$drive_thru)),
+    pan_day   = median(df_logit$pan_day)
+  )
+
+prof_pred <- predict(m_logit, newdata = profiles, type = "link", se.fit = TRUE)
+
+profiles |>
+  mutate(
+    p_hat = round(plogis(prof_pred$fit), 4),
+    lo    = round(plogis(prof_pred$fit - 1.96 * prof_pred$se.fit), 4),
+    hi    = round(plogis(prof_pred$fit + 1.96 * prof_pred$se.fit), 4)
+  ) |>
+  select(age, orderset, p_hat, lo, hi)
+```
+```{r}
+profiles_panday <- expand_grid(
+  pan_day  = c(10, 30, 50, 70, 90, 107),
+  orderset = factor(c("no_orderset", "orderset"),
+                    levels = levels(df_logit$orderset))
+) |>
+  mutate(
+    age        = median(df_logit$age),
+    gender     = factor("female",  levels = levels(df_logit$gender)),
+    drive_thru = factor("clinic",  levels = levels(df_logit$drive_thru))
+  )
+
+prof_pred2 <- predict(m_logit, newdata = profiles_panday, type = "link", se.fit = TRUE)
+
+profiles_panday |>
+  mutate(
+    p_hat = round(plogis(prof_pred2$fit), 4),
+    lo    = round(plogis(prof_pred2$fit - 1.96 * prof_pred2$se.fit), 4),
+    hi    = round(plogis(prof_pred2$fit + 1.96 * prof_pred2$se.fit), 4)
+  ) |>
+  select(pan_day, orderset, p_hat, lo, hi)
+```
+Вероятность положительного теста варьируется от 2.6% у ребёнка 2 лет без протокола до 11.6% у пожилого пациента 70 лет с протоколом, при этом связь нелинейная: вероятность позитивного теста растёт от 2.6% у ребёнка 2 лет (без протокола) до 10.6% у подростка 16 лет (с протоколом), затем незначительно снижается у взрослых старшего возраста; по дням пандемии наблюдается нелинейный паттерн с пиком в середине периода (~50-й день, 6.8–9.7%) и снижением к концу, что отражает расширение показаний к тестированию со временем.
+
+# Проверка качества модели
+
+
+```{r fig.width=5, fig.height=5}
+# ROC-AUC 
+roc_obj <- roc(df_logit$positive, fitted(m_logit))
+
+cat("AUC:", round(auc(roc_obj), 3), "\n")
+
+# График ROC
+ggroc(roc_obj, colour = "#d7301f", size = 1) +
+  geom_abline(slope = 1, intercept = 1, linetype = "dashed", colour = "grey50") +
+  annotate("text", x = 0.3, y = 0.2,
+           label = sprintf("AUC = %.3f", auc(roc_obj)),
+           size = 5) +
+  labs(x = "Specificity", y = "Sensitivity",
+       title = "ROC curve") +
+  theme_minimal()
+```
+
+AUC улучшился с 0.611 до 0.625 после введения нелинейной спецификации возраста и дня пандемии, однако остаётся умеренно низким. Это ожидаемо - в данных отсутствуют ключевые предикторы позитивности: симптомы, эпидемиологический анамнез, показания к тестированию.
+
+
+```{r fig.width=5, fig.height=5}
+cal_data <- df_logit |>
+  mutate(
+    pred   = fitted(m_logit),
+    decile = ntile(pred, 10)
+  ) |>
+  group_by(decile) |>
+  summarise(
+    mean_pred     = mean(pred),
+    mean_observed = mean(positive),
+    n             = n()
+  )
+
+ggplot(cal_data, aes(x = mean_pred, y = mean_observed)) +
+  geom_abline(slope = 1, intercept = 0,
+              linetype = "dashed", colour = "grey50") +
+  geom_point(aes(size = n), colour = "#d7301f") +
+  geom_line(colour = "#d7301f", alpha = 0.5) +
+  scale_size_continuous(range = c(2, 6), guide = "none") +
+  scale_x_continuous(labels = scales::percent) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(x = "Предсказанная вероятность",
+       y = "Наблюдаемая доля позитивных",
+       title = "Calibration plot",
+       caption = "Пунктир-идеальная калибровка. Размер точки-N в группе.") +
+  theme_minimal()
+```
+
+Calibration plot демонстрирует слабую калибровку-предсказанные вероятности сосредоточены в узком диапазоне (3-10%) и нестабильно соответствуют наблюдаемым значениям, что согласуется с низким AUC=0.625 и подтверждает что модель не предназначена для индивидуального предсказания риска.
+
+
+# Анализ чувствительности
+
+```{r}
+# Основная модель 
+# m_logit: 30-day filter, без demo_group, без patient_class, без payor_group
+key_terms <- c("ordersetorderset")
+# Sensitivity 1: только первый тест
+df_sens1 <- raw |>
+  filter(result %in% c("positive", "negative"),
+         demo_group != "unidentified",
+         age <= 110) |>
+  arrange(subject_id, pan_day) |>
+  distinct(subject_id, .keep_all = TRUE) |>  # первый тест
+  mutate(
+    positive   = as.integer(result == "positive"),
+    gender     = factor(gender,       levels = c("female", "male")),
+    drive_thru = factor(drive_thru_ind, levels = c(0,1),
+                        labels = c("clinic","drive_thru")),
+    orderset   = factor(orderset,     levels = c(0,1),
+                        labels = c("no_orderset","orderset")),
+    drive_thru = fct_relevel(drive_thru, "clinic"),
+    orderset   = fct_relevel(orderset,   "no_orderset")
+  )
+
+m_sens1 <- glm(
+  positive ~ ns(age, df=4) + gender + drive_thru + orderset + ns(pan_day, df=3),
+  data = df_sens1, family = binomial()
+)
+
+# Sensitivity 2: добавляем demo_group
+m_sens2 <- glm(
+  positive ~ ns(age, df=4) + gender + drive_thru + orderset + ns(pan_day, df=3) + demo_group,
+  data = df_logit, family = binomial()
+)
+
+# Sensitivity 3: только строки где patient_class не missing 
+df_sens3 <- df_logit |>
+  filter(patient_class != "patient_class_missing") |>
+  mutate(patient_class = fct_relevel(
+    fct_drop(patient_class), "outpatient")
+  )
+
+m_sens3 <- glm(
+  positive ~ ns(age, df=4) + gender + drive_thru + orderset + ns(pan_day, df=3) + patient_class,
+  data = df_sens3, family = binomial()
+)
+
+# Sensitivity 4: + payor_group 
+df_sens4 <- df_logit |>
+  filter(payor_group != "payor_group_missing") |>
+  mutate(payor_group = fct_relevel(
+    fct_drop(payor_group), "commercial")
+  )
+
+m_sens4 <- glm(
+  positive ~ ns(age, df=4) + gender + drive_thru + orderset + ns(pan_day, df=3) + payor_group,
+  data = df_sens4, family = binomial()
+)
+
+# Общее сравнение 
+bind_rows(
+  broom::tidy(m_logit, exponentiate = TRUE, conf.int = TRUE) |> mutate(model = "Основная"),
+  broom::tidy(m_sens1, exponentiate = TRUE, conf.int = TRUE) |> mutate(model = "Sens1: первый тест"),
+  broom::tidy(m_sens2, exponentiate = TRUE, conf.int = TRUE) |> mutate(model = "Sens2: + demo_group"),
+  broom::tidy(m_sens3, exponentiate = TRUE, conf.int = TRUE) |> mutate(model = "Sens3: + patient_class"),
+  broom::tidy(m_sens4, exponentiate = TRUE, conf.int = TRUE) |> mutate(model = "Sens4: + payor_group")
+) |>
+  filter(term %in% key_terms) |>
+  mutate(across(c(estimate, conf.low, conf.high), ~ round(.x, 3))) |>
+  select(model, term, OR = estimate, conf.low, conf.high, p.value)
+```
+orderset остаётся значимым во всех пяти моделях — OR варьирует от 1.27 до 1.66, все p < 0.05.
+
+
+# Интерпретация результатов
+
+Два предиктора оказались независимо значимы в adjusted модели.
+
+**Возраст:** входит в модель через natural spline — линейный OR неприменим. Predicted probabilities показывают нелинейную связь: вероятность позитивного 
+теста растёт от 2.6% у ребёнка 2 лет до 10.6% у подростка 16 лет, затем незначительно снижается у взрослых старшего возраста (до 8-11% в зависимости от наличия протокола).
+
+**День пандемии:** также входит через spline - нелинейная связь с пиком позитивности в середине периода (~50-й день, 6.8–9.7%) и снижением к концу, 
+что отражает расширение показаний к тестированию со временем.
+
+**Orderset (стандартный протокол):** единственный предиктор с интерпретируемым OR = 1.46 (95% CI: 1.20–1.79, p < 0.001) — при наличии стандартизованного протокола направления шанс положительного теста выше в 1.5 раза при контроле возраста, пола, типа забора и дня пандемии. Важно: orderset скорее всего является маркером типа пациента - протокол направления применялся для определённых категорий пациентов с более высоким априорным риском, поэтому причинная интерпретация невозможна.
+
+---
+
+# Ограничения
+
+* **Наблюдательный дизайн** - все ассоциации описательные, причинные выводы невозможны. `Orderset` может быть маркером типа пациента, а не причиной позитивности.
+* **Одноцентровое исследование** - CHOP это детский госпиталь с особым составом пациентов; результаты могут не переноситься на другие учреждения.
+* **~46% пропусков** в `patient_class` и `payor_group` - эти переменные исключены из основной модели; их эффекты не оценены.
+* **Отсутствуют ключевые клинические предикторы** - симптомы, контакты с больными, показания к тестированию. Именно поэтому AUC = 0.61: модель описывает логистику тестирования, а не биологию заболевания.
+* **Повторные измерения** - 14% пациентов тестировались более одного раза. Порог независимости 30 дней выбран на основании медианной продолжительности ПЦР-позитивности, но остаётся условным допущением.
+* **Период наблюдения** - данные относятся к первой волне 2020 года; паттерны тестирования и позитивности могли существенно измениться в последующих волнах.
+* **Взаимодействия переменных** - не тестировались — предикторы в модели отражают логистику тестирования (тип забора, протокол направления), а не клинические характеристики пациента.
+
+---
+
+# Вывод
+
+
+Среди доступных предикторов orderset (OR = 1.46, 95% CI: 1.20–1.79) остаётся единственным предиктором с интерпретируемым OR; возраст и день пандемии значимо ассоциированы с исходом нелинейно и интерпретируются через predicted probabilities - абсолютная вероятность позитивного теста варьируется от 2.6% до 11.6% в зависимости от возраста и наличия протокола. Наблюдательный дизайн не позволяет делать причинные выводы, а модель описывает логистику тестирования, но не предназначена для индивидуального предсказания риска (AUC = 0.625).
+

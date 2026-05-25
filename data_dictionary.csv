@@ -1,0 +1,16 @@
+Переменная,Тип,Описание,Использована в модели,Пропусков (n),Уникальных значений
+subject_id,numeric,Уникальный ID пациента,нет-ID,0,12339
+age,numeric,Возраст в годах на момент теста,да,0,109
+gender,character,Пол: female / male,да,0,2
+pan_day,numeric,День пандемии (день 1 = первый тест в датасете),да,0,102
+result,character,Результат ПЦР: negative / positive / invalid,исход,0,3
+demo_group,character,Демографическая группа: patient / client / misc adult / other adult,нет-коллинеарна с age (eta=0.79),0,5
+drive_thru_ind,binary,"Способ забора: 0 = клиника, 1 = drive-thru",да,0,2
+orderset,binary,"Наличие стандартизованного протокола направления: 0 = нет, 1 = есть",да,0,2
+patient_class,character,Тип визита: inpatient / outpatient / emergency и др.,нет-46% пропусков,7075,9
+payor_group,character,Тип страховки: commercial / government / unassigned и др.,нет-46% пропусков,7085,7
+ct_result,numeric,"Ct-значение ПЦР (45 = отрицательный, <45 = количество вируса)",нет-зеркало исхода,209,706
+col_rec_tat,numeric,Время от забора до получения образца (часы),нет-не предиктор позитивности,0,315
+rec_ver_tat,numeric,Время от получения до верификации результата (часы),нет-не предиктор позитивности,0,233
+test_id,character,Тип теста: covid / xcvd1,нет-административная метка,0,2
+clinic_name,character,Название клиники,нет-административная метка,0,88
